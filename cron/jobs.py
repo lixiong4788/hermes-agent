@@ -2879,6 +2879,10 @@ class _DueScan:
     # Miss/catch-up metrics, emitted once the save that persists the scan's repairs lands: an
     # unwritable store re-finds the same miss every tick, so counting before the save over-counts.
     on_saved: list[Callable[[], None]] = field(default_factory=list)
+    # Set when this tick's catch-up batch was cancelled wholesale because too many jobs were
+    # overdue (cron.catch_up_bulk_threshold). Every job then re-anchors to its next slot
+    # instead of replaying a stale one. None = no bulk cancellation this tick.
+    catch_up_bulk_cancelled: Optional[dict[str, int]] = None
 
     def find(self, job_id: Any) -> Optional[dict[str, Any]]:
         return next((rj for rj in self.raw_jobs if rj["id"] == job_id), None)
@@ -3095,6 +3099,77 @@ def _reanchor_stale_cron(d: _DueJob) -> bool:
     return False
 
 
+def _job_skips_catch_up(job: dict[str, Any]) -> bool:
+    """True when *job* must not run a missed occurrence (skip, re-anchor to the next slot).
+
+    Per-job opt-out for catch-up. ``cron.catch_up_missed: false`` is global (the
+    official knob has no per-job override), which is too blunt when only some
+    schedules should stay put when the machine was asleep: a weekday market
+    report missed by a sleeping laptop should simply wait for the next trading
+    day, while a daily digest should still be produced.
+
+    Opt-in per job via ``"catch_up": false`` in the job record.
+    """
+    try:
+        value = job.get("catch_up")
+    except Exception:
+        return False
+    return value is False
+
+
+def _catch_up_bulk_threshold() -> int:
+    """How many catch-up jobs may run at once before the whole batch is dropped.
+
+    ``cron.catch_up_bulk_threshold`` (default 3). A laptop that slept through
+    the trading day comes back with dozens of missed slots; replaying them all
+    in one burst is worse than useless — the market data it fetches is hours
+    stale, and the burst floods the push channel. Above the threshold the
+    whole catch-up batch is cancelled and every job simply waits for its next
+    scheduled slot.
+
+    A non-positive value disables the threshold (no bulk cap).
+    """
+    return _cron_config_number("catch_up_bulk_threshold", 3, int)
+
+
+def _count_pending_catch_ups(jobs: list[dict[str, Any]], now: Any) -> int:
+    """How many of *jobs* would be caught up (missed and past their grace) right now.
+
+    Mirrors the decision in _fast_forward_missed_recurring, but read-only: it
+    must not persist anything, so it can run BEFORE the due scan and only
+    count what the scan would actually replay.
+    """
+    count = 0
+    for job in jobs:
+        try:
+            if not job.get("enabled", True):
+                continue
+            if is_terminal_job(job) and not _is_recoverable_error_job(job):
+                continue
+            schedule = job.get("schedule") or {}
+            if str(schedule.get("kind") or "") not in {"cron", "interval"}:
+                continue
+            if _job_skips_catch_up(job):
+                continue
+            next_run = job.get("next_run_at")
+            if not next_run:
+                continue
+            try:
+                next_dt = _ensure_aware(datetime.fromisoformat(next_run))
+            except (ValueError, TypeError):
+                continue
+            # Not due yet — this is a normal on-time fire, not a catch-up.
+            if _instant_after(next_dt, now):
+                continue
+            grace = _compute_grace_seconds(schedule)
+            if _elapsed_seconds(now, next_dt) <= grace:
+                continue  # within grace: an ordinary late fire, not a catch-up
+            count += 1
+        except Exception:
+            continue
+    return count
+
+
 def _fast_forward_missed_recurring(d: _DueJob, grace: int) -> bool:
     """Re-anchor accumulated misses; return whether catch-up was explicitly disabled.
 
@@ -3109,11 +3184,34 @@ def _fast_forward_missed_recurring(d: _DueJob, grace: int) -> bool:
     if not new_next:
         return False
     d.scan.persist(d.job["id"], next_run_at=new_next)
-    if (_instant_after(_ensure_aware(datetime.fromisoformat(new_next)), d.scan.now)
-            and not _cron_config_number("catch_up_missed", True, lambda value: value is not False)):
+
+    # 整批取消: 本轮待补跑的任务数超过阈值时, 全部改等下一个正常槽位。
+    # 这台机器整夜休眠后回来, 会积压几十个错过的槽位; 一次性全放出来只会
+    # 拿几小时前的旧数据狂推消息, 不如一个都不补。
+    bulk = getattr(d.scan, "catch_up_bulk_cancelled", None)
+    if bulk:
         logger.info(
             "Job '%s' missed its scheduled time (%s, grace=%ds). "
-            "Skipping missed occurrence because cron.catch_up_missed is false; next run: %s",
+            "Skipping missed occurrence: %d catch-ups pending this tick exceed the "
+            "threshold of %d (cron.catch_up_bulk_threshold); next run: %s",
+            d.label, d.next_run, grace, bulk["count"], bulk["threshold"], new_next)
+        d.scan.on_saved.append(lambda job=d.job: record_cron_missed(job))
+        return True
+
+    if (_instant_after(_ensure_aware(datetime.fromisoformat(new_next)), d.scan.now)
+            and not _cron_config_number("catch_up_missed", True, lambda value: value is not False)
+            and not _job_skips_catch_up(d.job)):
+        logger.info(
+            "Job '%s' missed its scheduled time (%s, grace=%ds). "
+            "Running now; next run provisionally set to: %s (re-anchored on completion)",
+            d.label, d.next_run, grace, new_next)
+        from cron.occurrences import record_catch_up_occurrence
+        d.scan.on_saved.append(record_catch_up_occurrence)
+        return False
+    if _job_skips_catch_up(d.job):
+        logger.info(
+            "Job '%s' missed its scheduled time (%s, grace=%ds). "
+            "Skipping missed occurrence because the job opts out of catch-up; next run: %s",
             d.label, d.next_run, grace, new_next)
         d.scan.on_saved.append(lambda job=d.job: record_cron_missed(job))
         return True
@@ -3124,7 +3222,6 @@ def _fast_forward_missed_recurring(d: _DueJob, grace: int) -> bool:
     from cron.occurrences import record_catch_up_occurrence
     d.scan.on_saved.append(record_catch_up_occurrence)
     return False
-
 
 def _retire_expired_oneshot(d: _DueJob) -> bool:
     """One-shot grace gate; True when the job must not fire this tick.
@@ -3310,6 +3407,22 @@ def _get_due_jobs_locked() -> list[dict[str, Any]]:
     if _sweep_completed_oneshots(raw_jobs, scan.now, removed_ids=scan.removed):
         scan.needs_save = True
         jobs = [j for j in jobs if scan.find(j.get("id")) is not None]
+
+    # 整批取消预判: 先数一数本轮会有多少个任务要补跑。超过阈值就整批取消,
+    # 每个任务都改等自己的下一个正常槽位 —— 避免休眠一整夜后一次性补跑几十个。
+    threshold = _catch_up_bulk_threshold()
+    if threshold > 0:
+        pending_catch_ups = _count_pending_catch_ups(jobs, scan.now)
+        if pending_catch_ups >= threshold:
+            scan.catch_up_bulk_cancelled = {
+                "count": pending_catch_ups,
+                "threshold": threshold,
+            }
+            logger.info(
+                "Catch-up batch cancelled: %d jobs would be caught up this tick "
+                "(>= threshold %d, cron.catch_up_bulk_threshold). All of them wait "
+                "for their next scheduled slot instead of replaying stale slots.",
+                pending_catch_ups, threshold)
 
     due = []
     for job in jobs:
