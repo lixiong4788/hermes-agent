@@ -226,6 +226,16 @@ def memory_tool(action: str | None = None, target: str = "memory", content: str 
     or batch (``operations``, atomic against the final budget). ``new_text``
     aliases ``content``."""
     if store is None:
+        # 2026-10-31: 这个错误信息此前完全没有线索, 导致 agent 以为是「记忆满了」
+        # 而反复用 terminal 手工改 MEMORY.md, 单次任务烧掉 150 次迭代。
+        # 打印调用栈, 才能看出 store 到底为什么是 None。
+        import logging as _mt_logging
+        import traceback as _mt_traceback
+        _mt_logging.getLogger(__name__).warning(
+            "[MEMORY] store is None — memory tool unavailable. kwargs keys=%s\n%s",
+            sorted(k for k in ("store",) if False) or "n/a",
+            "".join(_mt_traceback.format_stack()[-6:]),
+        )
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
     token = FAILURE_CLASS.set("other")
     try:

@@ -1322,7 +1322,7 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
     )
     if not skip_memory or _memory_toolset_requested:
         # Memory is optional — don't break agent init
-        with suppress(Exception):
+        try:
             from tools.memory_tool import (
                 MemoryStore, get_builtin_memory_config, get_builtin_memory_store_flags,
             )
@@ -1339,6 +1339,15 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
                     user_profile_enabled=agent._user_profile_enabled,
                 )
                 agent._memory_store.load_from_disk()
+        except Exception as _mem_init_exc:
+            # Previously swallowed by `suppress(Exception)`, which made a broken
+            # memory tool look like "Memory is not available" with no clue why.
+            # Log it once per process so the real cause is visible in the logs.
+            import logging as _mem_logging
+            _mem_logging.getLogger(__name__).warning(
+                "[MEMORY] built-in store init failed: %s: %s",
+                type(_mem_init_exc).__name__, _mem_init_exc, exc_info=True,
+            )
 
     # External memory provider plugin (one at a time, alongside built-in): memory.provider.
     agent._memory_manager = None
